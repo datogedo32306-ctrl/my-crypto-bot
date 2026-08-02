@@ -8,9 +8,7 @@ from binance.client import Client
 
 app = Flask(__name__)
 
-# ------------------------------------------------------------------
-# 1. שליפת מפתחות ממשתני הסביבה (Render Environment Variables)
-# ------------------------------------------------------------------
+# שליפת מפתחות ממשתני הסביבה
 BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY', '').strip()
 BINANCE_SECRET_KEY = os.environ.get('BINANCE_SECRET_KEY', '').strip()
 
@@ -19,7 +17,7 @@ TRADING_ACTIVE = True        # מצב פעיל / מוקפא
 SYMBOL = 'BTCUSDT'           # המטבע הראשי למסחר
 BASE_USDT_SIZE = 20.0        # גודל עסקה בסיסי בדולרים
 STOP_LOSS_PCT = 0.02         # עצירת הפסד קשיחה ב-2%
-TRAILING_STOP_PCT = 0.015    # Trailing Stop דינמי של 1.5% לנעילת רווחים
+TRAILING_STOP_PCT = 0.015    # Trailing Stop דינמי של 1.5%
 
 # מעקב אחרי פוזיציה פתוחה בלייב
 position = {
@@ -32,19 +30,20 @@ position = {
 }
 
 # ------------------------------------------------------------------
-# 2. התחברות ל-Binance עם עקיפת חסימת ה-IP משרתי ארה"ב
+# התחברות ל-Binance עם עקיפת ה-API_URL לפני ה-Ping הראשוני
 # ------------------------------------------------------------------
 binance_client = None
 try:
     if BINANCE_API_KEY and BINANCE_SECRET_KEY:
+        # דריסת כתובת ברירת המחדל של מחלקת Client לפני האתחול
+        Client.API_URL = 'https://api1.binance.com/api'
         binance_client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
-        # עקיפת חסימת ה-IP של שרתי Render בארה"ב מול בינאנס
-        binance_client.API_URL = 'https://api1.binance.com/api'
+        print("✅ Binance Client connected successfully via api1!")
 except Exception as e:
-    print(f"Error initializing Binance client: {e}")
+    print(f"❌ Error initializing Binance client: {e}")
 
 # ------------------------------------------------------------------
-# 3. פונקציות ניתוח שוק (סנטימנט + נפח מסחר)
+# פונקציות ניתוח שוק (סנטימנט + נפח מסחר)
 # ------------------------------------------------------------------
 def get_market_sentiment():
     """שליפת סנטימנט השוק בזמן אמת (Fear & Greed Index)"""
@@ -59,18 +58,18 @@ def get_market_sentiment():
 def get_volume_spike():
     """זיהוי פריצות ונפח מסחר חריג (Volume Spike)"""
     try:
+        if not binance_client:
+            return False
         klines = binance_client.get_klines(symbol=SYMBOL, interval=Client.KLINE_INTERVAL_5MINUTE, limit=6)
         recent_volumes = [float(k[5]) for k in klines[:-1]]
         avg_volume = sum(recent_volumes) / len(recent_volumes)
         latest_volume = float(klines[-1][5])
-        
-        # זיהוי נפח מסחר הגבוה פי 1.8 מהממוצע ב-5 דקות האחרונות
         return latest_volume > (avg_volume * 1.8)
     except Exception:
         return False
 
 # ------------------------------------------------------------------
-# 4. לולאת המסחר האוטומטית (רצה ברקע 24/7)
+# לולאת המסחר האוטומטית (רצה ברקע 24/7)
 # ------------------------------------------------------------------
 def auto_trading_loop():
     global TRADING_ACTIVE, position
@@ -85,26 +84,25 @@ def auto_trading_loop():
                     sentiment_val, sentiment_text = get_market_sentiment()
                     is_volume_spike = get_volume_spike()
                     
-                    # ניהול גודל עסקה דינמי: הגדלת הסכום ב-30% כשיש פריצת נפח מסחר
                     trade_size = BASE_USDT_SIZE * 1.3 if is_volume_spike else BASE_USDT_SIZE
 
-                    # כניסה ל-SHORT (סנטימנט שלילי + נפח מסחר)
+                    # כניסה ל-SHORT
                     if sentiment_val < 35 and is_volume_spike:
                         position['in_trade'] = True
                         position['side'] = 'SHORT'
                         position['entry_price'] = current_price
                         position['lowest_price'] = current_price
                         position['amount'] = round(trade_size / current_price, 5)
-                        print(f"📉 SHORT OPENED at {current_price} | Sentiment: {sentiment_text} | Size: ${trade_size}")
+                        print(f"📉 SHORT OPENED at {current_price} | Size: ${trade_size}")
 
-                    # כניסה ל-LONG (סנטימנט חיובי + נפח מסחר)
+                    # כניסה ל-LONG
                     elif sentiment_val > 65 and is_volume_spike:
                         position['in_trade'] = True
                         position['side'] = 'LONG'
                         position['entry_price'] = current_price
                         position['highest_price'] = current_price
                         position['amount'] = round(trade_size / current_price, 5)
-                        print(f"📈 LONG OPENED at {current_price} | Sentiment: {sentiment_text} | Size: ${trade_size}")
+                        print(f"📈 LONG OPENED at {current_price} | Size: ${trade_size}")
 
                 # --- ב. ניהול פוזיציה קיימת (Trailing Stop & Hard Stop) ---
                 elif position['in_trade']:
@@ -118,11 +116,7 @@ def auto_trading_loop():
                         trailing_stop_price = position['highest_price'] * (1 - TRAILING_STOP_PCT)
                         hard_stop_price = entry * (1 - STOP_LOSS_PCT)
 
-                        if current_price <= hard_stop_price:
-                            print(f"🛑 HARD STOP LOSS (LONG) at {current_price}")
-                            position['in_trade'] = False
-                        elif current_price <= trailing_stop_price and position['highest_price'] > entry:
-                            print(f"🎯 TRAILING STOP (LONG PROFIT) at {current_price} | Peak: {position['highest_price']}")
+                        if current_price <= hard_stop_price or (current_price <= trailing_stop_price and position['highest_price'] > entry):
                             position['in_trade'] = False
 
                     elif side == 'SHORT':
@@ -132,28 +126,24 @@ def auto_trading_loop():
                         trailing_stop_price = position['lowest_price'] * (1 + TRAILING_STOP_PCT)
                         hard_stop_price = entry * (1 + STOP_LOSS_PCT)
 
-                        if current_price >= hard_stop_price:
-                            print(f"🛑 HARD STOP LOSS (SHORT) at {current_price}")
-                            position['in_trade'] = False
-                        elif current_price >= trailing_stop_price and position['lowest_price'] < entry:
-                            print(f"🎯 TRAILING STOP (SHORT PROFIT) at {current_price} | Lowest: {position['lowest_price']}")
+                        if current_price >= hard_stop_price or (current_price >= trailing_stop_price and position['lowest_price'] < entry):
                             position['in_trade'] = False
 
         except Exception as e:
             print(f"Error in trading loop: {e}")
             
-        time.sleep(10) # בדיקת מחיר וסריקה כל 10 שניות
+        time.sleep(10)
 
 # הפעלת תהליך הרקע
 thread = Thread(target=auto_trading_loop, daemon=True)
 thread.start()
 
 # ------------------------------------------------------------------
-# 5. ממשק השרת והתממשקות ל-WhatsApp (Twilio Webhook)
+# ממשק השרת והתממשקות ל-WhatsApp
 # ------------------------------------------------------------------
 @app.route('/', methods=['GET'])
 def home():
-    return "Ultra-Smart Crypto Algo Bot is Active and Running!"
+    return "Ultra-Smart Crypto Algo Bot is Active!"
 
 @app.route('/webhook', methods=['POST'])
 @app.route('/whatsapp', methods=['POST'])
@@ -164,17 +154,14 @@ def whatsapp_reply():
     resp = MessagingResponse()
     msg = resp.message()
 
-    # פקודת עצירה
     if incoming_msg in ['עצור', 'stop', 'חרום']:
         TRADING_ACTIVE = False
         msg.body("🛑 המסחר האוטומטי הוקפא!")
 
-    # פקודת הפעלה
     elif incoming_msg in ['הפעל', 'start', 'רוץ']:
         TRADING_ACTIVE = True
         msg.body("🟢 הבוט החכם הופעל מחדש ומנטר פריצות בשוק!")
 
-    # פקודת סטטוס
     elif incoming_msg in ['סטטוס', 'status', 'מה המצב']:
         state = "🟢 פעיל" if TRADING_ACTIVE else "🔴 מוקפא"
         val, text = get_market_sentiment()
@@ -189,12 +176,13 @@ def whatsapp_reply():
             try:
                 acc = binance_client.get_account()
                 usdt_bal = next((item['free'] for item in acc['balances'] if item['asset'] == 'USDT'), '0')
-            except:
-                pass
+            except Exception as ex:
+                usdt_bal = f"שגיאה שליפה: {ex}"
+        else:
+            usdt_bal = "לא מחובר ל-Binance"
 
-        msg.body(f"🧠 **סטטוס בוט אלגוריתמי מתקדם:**\n• מצב: {state}\n• סנטימנט שוק: {text} ({val}/100)\n• יתרת USDT: ${float(usdt_bal):.2f}\n\n📌 **פוזיציה נוכחית:**\n{pos_info}")
+        msg.body(f"🧠 **סטטוס בוט אלגוריתמי מתקדם:**\n• מצב: {state}\n• סנטימנט שוק: {text} ({val}/100)\n• יתרת USDT: {usdt_bal}\n\n📌 **פוזיציה נוכחית:**\n{pos_info}")
 
-    # סגירת פוזיציות מיידית
     elif incoming_msg in ['סגור הכל', 'close']:
         if position['in_trade']:
             position['in_trade'] = False

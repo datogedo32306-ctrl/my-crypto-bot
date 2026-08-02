@@ -7,7 +7,7 @@ from twilio.twiml.messaging_response import MessagingResponse
 
 app = Flask(__name__)
 
-# שליפת מפתחות
+# שליפת מפתחות ממשתני הסביבה
 BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY', '').strip()
 BINANCE_SECRET_KEY = os.environ.get('BINANCE_SECRET_KEY', '').strip()
 

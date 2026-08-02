@@ -4,51 +4,50 @@ import requests
 from threading import Thread
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
-from binance.client import Client
 
 app = Flask(__name__)
 
-# שליפת מפתחות ממשתני הסביבה
+# שליפת מפתחות
 BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY', '').strip()
 BINANCE_SECRET_KEY = os.environ.get('BINANCE_SECRET_KEY', '').strip()
 
-# הגדרות אלגוריתם המסחר
+# הגדרות מסחר
 TRADING_ACTIVE = True        # מצב פעיל / מוקפא
 SYMBOL = 'BTCUSDT'           # המטבע הראשי למסחר
-BASE_USDT_SIZE = 20.0        # גודל עסקה בסיסי בדולרים
-STOP_LOSS_PCT = 0.02         # עצירת הפסד קשיחה ב-2%
+BASE_USDT_SIZE = 20.0        # גודל עסקה בדולרים
+STOP_LOSS_PCT = 0.02         # עצירת הפסד ב-2%
 TRAILING_STOP_PCT = 0.015    # Trailing Stop דינמי של 1.5%
 
-# מעקב אחרי פוזיציה פתוחה בלייב
+# כתובת API עוקפת חסימת US
+BINANCE_BASE_URL = 'https://api1.binance.com'
+
+# מעקב אחרי פוזיציה בלייב
 position = {
     'in_trade': False,
     'side': None,             # 'LONG' או 'SHORT'
     'entry_price': 0.0,
-    'highest_price': 0.0,     # למעקב Trailing Stop ב-LONG
-    'lowest_price': 0.0,      # למעקב Trailing Stop ב-SHORT
+    'highest_price': 0.0,
+    'lowest_price': 0.0,
     'amount': 0.0
 }
 
 # ------------------------------------------------------------------
-# התחברות ל-Binance עם עקיפת ה-API_URL לפני ה-Ping הראשוני
+# פונקציות פנימיות לעבודה ישירה מול Binance (ללא חסימה!)
 # ------------------------------------------------------------------
-binance_client = None
-try:
-    if BINANCE_API_KEY and BINANCE_SECRET_KEY:
-        # דריסת כתובת ברירת המחדל של מחלקת Client לפני האתחול
-        Client.API_URL = 'https://api1.binance.com/api'
-        binance_client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
-        print("✅ Binance Client connected successfully via api1!")
-except Exception as e:
-    print(f"❌ Error initializing Binance client: {e}")
-
-# ------------------------------------------------------------------
-# פונקציות ניתוח שוק (סנטימנט + נפח מסחר)
-# ------------------------------------------------------------------
-def get_market_sentiment():
-    """שליפת סנטימנט השוק בזמן אמת (Fear & Greed Index)"""
+def get_binance_price(symbol):
+    """שליפת מחיר בלייב משרת עוקף"""
     try:
-        res = requests.get('https://api.alternative.me/fng/').json()
+        res = requests.get(f"{BINANCE_BASE_URL}/api/v3/ticker/price", params={'symbol': symbol}, timeout=5)
+        if res.status_code == 200:
+            return float(res.json()['price'])
+    except Exception as e:
+        print(f"Price fetch error: {e}")
+    return None
+
+def get_market_sentiment():
+    """שליפת סנטימנט השוק (Fear & Greed Index)"""
+    try:
+        res = requests.get('https://api.alternative.me/fng/', timeout=5).json()
         val = int(res['data'][0]['value'])
         txt = res['data'][0]['value_classification']
         return val, txt
@@ -56,94 +55,89 @@ def get_market_sentiment():
         return 50, "Neutral"
 
 def get_volume_spike():
-    """זיהוי פריצות ונפח מסחר חריג (Volume Spike)"""
+    """זיהוי נפח מסחר חריג"""
     try:
-        if not binance_client:
-            return False
-        klines = binance_client.get_klines(symbol=SYMBOL, interval=Client.KLINE_INTERVAL_5MINUTE, limit=6)
-        recent_volumes = [float(k[5]) for k in klines[:-1]]
-        avg_volume = sum(recent_volumes) / len(recent_volumes)
-        latest_volume = float(klines[-1][5])
-        return latest_volume > (avg_volume * 1.8)
+        res = requests.get(f"{BINANCE_BASE_URL}/api/v3/klines", params={'symbol': SYMBOL, 'interval': '5m', 'limit': 6}, timeout=5)
+        if res.status_code == 200:
+            klines = res.json()
+            recent_volumes = [float(k[5]) for k in klines[:-1]]
+            avg_volume = sum(recent_volumes) / len(recent_volumes)
+            latest_volume = float(klines[-1][5])
+            return latest_volume > (avg_volume * 1.8)
     except Exception:
-        return False
+        pass
+    return False
 
 # ------------------------------------------------------------------
-# לולאת המסחר האוטומטית (רצה ברקע 24/7)
+# לולאת המסחר האוטומטית
 # ------------------------------------------------------------------
 def auto_trading_loop():
     global TRADING_ACTIVE, position
     while True:
         try:
-            if TRADING_ACTIVE and binance_client:
-                ticker = binance_client.get_symbol_ticker(symbol=SYMBOL)
-                current_price = float(ticker['price'])
-                
-                # --- א. חיפוש הזדמנות כניסה (כשאין פוזיציה) ---
-                if not position['in_trade']:
-                    sentiment_val, sentiment_text = get_market_sentiment()
-                    is_volume_spike = get_volume_spike()
-                    
-                    trade_size = BASE_USDT_SIZE * 1.3 if is_volume_spike else BASE_USDT_SIZE
+            if TRADING_ACTIVE:
+                current_price = get_binance_price(SYMBOL)
+                if current_price:
+                    # 1. חיפוש כניסה לעסקה
+                    if not position['in_trade']:
+                        sentiment_val, sentiment_text = get_market_sentiment()
+                        is_volume_spike = get_volume_spike()
+                        trade_size = BASE_USDT_SIZE * 1.3 if is_volume_spike else BASE_USDT_SIZE
 
-                    # כניסה ל-SHORT
-                    if sentiment_val < 35 and is_volume_spike:
-                        position['in_trade'] = True
-                        position['side'] = 'SHORT'
-                        position['entry_price'] = current_price
-                        position['lowest_price'] = current_price
-                        position['amount'] = round(trade_size / current_price, 5)
-                        print(f"📉 SHORT OPENED at {current_price} | Size: ${trade_size}")
-
-                    # כניסה ל-LONG
-                    elif sentiment_val > 65 and is_volume_spike:
-                        position['in_trade'] = True
-                        position['side'] = 'LONG'
-                        position['entry_price'] = current_price
-                        position['highest_price'] = current_price
-                        position['amount'] = round(trade_size / current_price, 5)
-                        print(f"📈 LONG OPENED at {current_price} | Size: ${trade_size}")
-
-                # --- ב. ניהול פוזיציה קיימת (Trailing Stop & Hard Stop) ---
-                elif position['in_trade']:
-                    entry = position['entry_price']
-                    side = position['side']
-
-                    if side == 'LONG':
-                        if current_price > position['highest_price']:
-                            position['highest_price'] = current_price
-                        
-                        trailing_stop_price = position['highest_price'] * (1 - TRAILING_STOP_PCT)
-                        hard_stop_price = entry * (1 - STOP_LOSS_PCT)
-
-                        if current_price <= hard_stop_price or (current_price <= trailing_stop_price and position['highest_price'] > entry):
-                            position['in_trade'] = False
-
-                    elif side == 'SHORT':
-                        if current_price < position['lowest_price']:
+                        if sentiment_val < 35 and is_volume_spike:
+                            position['in_trade'] = True
+                            position['side'] = 'SHORT'
+                            position['entry_price'] = current_price
                             position['lowest_price'] = current_price
-                        
-                        trailing_stop_price = position['lowest_price'] * (1 + TRAILING_STOP_PCT)
-                        hard_stop_price = entry * (1 + STOP_LOSS_PCT)
+                            position['amount'] = round(trade_size / current_price, 5)
+                            print(f"📉 SHORT OPENED at {current_price}")
 
-                        if current_price >= hard_stop_price or (current_price >= trailing_stop_price and position['lowest_price'] < entry):
-                            position['in_trade'] = False
+                        elif sentiment_val > 65 and is_volume_spike:
+                            position['in_trade'] = True
+                            position['side'] = 'LONG'
+                            position['entry_price'] = current_price
+                            position['highest_price'] = current_price
+                            position['amount'] = round(trade_size / current_price, 5)
+                            print(f"📈 LONG OPENED at {current_price}")
+
+                    # 2. ניהול פוזיציה (Trailing Stop & Stop-Loss)
+                    elif position['in_trade']:
+                        entry = position['entry_price']
+                        side = position['side']
+
+                        if side == 'LONG':
+                            if current_price > position['highest_price']:
+                                position['highest_price'] = current_price
+                            trailing_stop = position['highest_price'] * (1 - TRAILING_STOP_PCT)
+                            hard_stop = entry * (1 - STOP_LOSS_PCT)
+
+                            if current_price <= hard_stop or (current_price <= trailing_stop and position['highest_price'] > entry):
+                                position['in_trade'] = False
+
+                        elif side == 'SHORT':
+                            if current_price < position['lowest_price']:
+                                position['lowest_price'] = current_price
+                            trailing_stop = position['lowest_price'] * (1 + TRAILING_STOP_PCT)
+                            hard_stop = entry * (1 + STOP_LOSS_PCT)
+
+                            if current_price >= hard_stop or (current_price >= trailing_stop and position['lowest_price'] < entry):
+                                position['in_trade'] = False
 
         except Exception as e:
             print(f"Error in trading loop: {e}")
             
         time.sleep(10)
 
-# הפעלת תהליך הרקע
+# הפעלת לולאת הרקע
 thread = Thread(target=auto_trading_loop, daemon=True)
 thread.start()
 
 # ------------------------------------------------------------------
-# ממשק השרת והתממשקות ל-WhatsApp
+# ממשק WhatsApp
 # ------------------------------------------------------------------
 @app.route('/', methods=['GET'])
 def home():
-    return "Ultra-Smart Crypto Algo Bot is Active!"
+    return "Crypto Algo Bot is Live and Running!"
 
 @app.route('/webhook', methods=['POST'])
 @app.route('/whatsapp', methods=['POST'])
@@ -160,38 +154,30 @@ def whatsapp_reply():
 
     elif incoming_msg in ['הפעל', 'start', 'רוץ']:
         TRADING_ACTIVE = True
-        msg.body("🟢 הבוט החכם הופעל מחדש ומנטר פריצות בשוק!")
+        msg.body("🟢 הבוט הופעל מחדש ומנטר את השוק!")
 
     elif incoming_msg in ['סטטוס', 'status', 'מה המצב']:
         state = "🟢 פעיל" if TRADING_ACTIVE else "🔴 מוקפא"
         val, text = get_market_sentiment()
-        
+        price = get_binance_price(SYMBOL)
+        price_str = f"${price:,.2f}" if price else "שגיאה בשליפה"
+
         pos_info = "מחכה לזיהוי פריצה/סנטימנט בשוק"
         if position['in_trade']:
             peak_info = f"שיא: ${position['highest_price']}" if position['side'] == 'LONG' else f"שפל: ${position['lowest_price']}"
             pos_info = f"בעסקה: {position['side']} על {SYMBOL}\n• מחיר כניסה: ${position['entry_price']}\n• {peak_info}"
 
-        usdt_bal = "0"
-        if binance_client:
-            try:
-                acc = binance_client.get_account()
-                usdt_bal = next((item['free'] for item in acc['balances'] if item['asset'] == 'USDT'), '0')
-            except Exception as ex:
-                usdt_bal = f"שגיאה שליפה: {ex}"
-        else:
-            usdt_bal = "לא מחובר ל-Binance"
-
-        msg.body(f"🧠 **סטטוס בוט אלגוריתמי מתקדם:**\n• מצב: {state}\n• סנטימנט שוק: {text} ({val}/100)\n• יתרת USDT: {usdt_bal}\n\n📌 **פוזיציה נוכחית:**\n{pos_info}")
+        msg.body(f"🧠 **סטטוס בוט אלגוריתמי:**\n• מצב: {state}\n• מחיר BTC נוכחי: {price_str}\n• סנטימנט שוק: {text} ({val}/100)\n\n📌 **פוזיציה נוכחית:**\n{pos_info}")
 
     elif incoming_msg in ['סגור הכל', 'close']:
         if position['in_trade']:
             position['in_trade'] = False
-            msg.body("⚠️ הפוזיציה נסגרה ידנית מ-WhatsApp והבוט חזר לסרוק את השוק.")
+            msg.body("⚠️ הפוזיציה נסגרה ידנית מ-WhatsApp.")
         else:
             msg.body("אין פוזיציה פתוחה כרגע.")
 
     else:
-        msg.body("📌 פקודות WhatsApp זמינות:\n• `סטטוס` - בדיקת פוזיציה, שיאי מחיר וסנטימנט\n• `עצור` - הקפאת הבוט\n• `הפעל` - הפעלת הבוט\n• `סגור הכל` - סגירת פוזיציה קיימת")
+        msg.body("📌 פקודות WhatsApp זמינות:\n• `סטטוס` - בדיקת פוזיציה ומחירים בלייב\n• `עצור` - הקפאת הבוט\n• `הפעל` - הפעלת הבוט\n• `סגור הכל` - סגירת פוזיציה קיימת")
 
     return str(resp)
 

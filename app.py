@@ -13,7 +13,7 @@ from twilio.rest import Client
 app = Flask(__name__)
 
 # ==============================================================================
-# הגדרות ומשתני סביבה (נלקחים מ-Render/Environment Variables)
+# הגדרות ומשתני סביבה (נלקחים מ-Render)
 # ==============================================================================
 BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY', '').strip()
 BINANCE_SECRET_KEY = os.environ.get('BINANCE_SECRET_KEY', '').strip()
@@ -260,7 +260,7 @@ def auto_trading_loop():
                             if current_price >= hard_stop:
                                 close_trade = True
                                 reason = "Stop Loss Hit (ATR Protected)"
-                            elif current_price <= trailing_stop and position['lowest_price'] < (entry - (atr * 1.2)):
+                            elif current_price >= trailing_stop and position['lowest_price'] < (entry - (atr * 1.2)):
                                 close_trade = True
                                 reason = "Trailing Stop Hit (Profit Secured)"
 

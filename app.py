@@ -1,3 +1,10 @@
+# פקודה חדשה לבדיקת IP של השרת
+    if raw_msg in ['ip', 'אייפי', 'מה ה ip']:
+        try:
+            my_ip = requests.get('https://api.ipify.org', timeout=5).text.strip()
+            msg.body(f"🌐 כתובת ה-IP של השרת ב-Render היא:\n`{my_ip}`\n\nהעתק אותה והדבק ב-Binance!")
+        except Exception as e:
+            msg.body(f"❌ שגיאה בשליפת IP: {e}")
 import os
 import time
 import requests

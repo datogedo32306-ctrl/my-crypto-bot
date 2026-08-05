@@ -6,6 +6,7 @@ import requests
 import numpy as np
 from datetime import datetime, timedelta
 from threading import Thread
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
@@ -13,7 +14,7 @@ from twilio.rest import Client
 app = Flask(__name__)
 
 # ==============================================================================
-# הגדרות ומשתני סביבה (נלקחים מ-Render)
+# הגדרות ומשתני סביבה
 # ==============================================================================
 BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY', '').strip()
 BINANCE_SECRET_KEY = os.environ.get('BINANCE_SECRET_KEY', '').strip()
@@ -21,35 +22,37 @@ TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID', '').strip()
 TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN', '').strip()
 MY_PHONE_NUMBER = os.environ.get('MY_PHONE_NUMBER', '').strip()
 
-# פרמטרים של ניהול סיכונים
-TRADING_ACTIVE = True               # פעיל / מוקפא
-MAX_DAILY_LOSS_PCT = 0.03          # מקסימום הפסד יומי מותר (3%)
+# פרמטרים של מסחר וניהול סיכונים
+TRADING_ACTIVE = True
+MAX_DAILY_LOSS_PCT = 0.03          # מקסימום הפסד יומי (3%)
 BASE_USDT_SIZE = 25.0              # גודל עסקה בדולרים
-LEVERAGE = 5                        # מנוף X5
-MIN_DAILY_VOLUME = 5000000          # מינימום 5 מיליון דולר נפח יומי למניעת מניפולציות
+LEVERAGE = 5                        # מנוף X5 ב-Futures
+MIN_DAILY_VOLUME = 5000000          # מינימום 5M$ נפח יומי
+MAX_PARALLEL_THREADS = 20          # כמות מטבעות שנסרקים במקביל
 
-# מעקב סיכונים ופוזיציות
 account_guard = {
     'start_balance': 0.0,
     'daily_pnl': 0.0,
     'lock_until': None
 }
 
-position = {
-    'in_trade': False,
-    'symbol': None,
-    'side': None,
-    'entry_price': 0.0,
-    'highest_price': 0.0,
-    'lowest_price': 0.0,
-    'quantity': 0.0,
-    'stop_loss_price': 0.0,
-    'stop_order_id': None
+# ניהול פוזיציות נפרד ל-Spot ול-Futures
+positions = {
+    'FUTURES': {
+        'in_trade': False, 'symbol': None, 'side': None, 'entry_price': 0.0,
+        'highest_price': 0.0, 'lowest_price': 0.0, 'quantity': 0.0,
+        'stop_loss_price': 0.0, 'stop_order_id': None
+    },
+    'SPOT': {
+        'in_trade': False, 'symbol': None, 'side': 'LONG', 'entry_price': 0.0,
+        'highest_price': 0.0, 'lowest_price': 0.0, 'quantity': 0.0,
+        'stop_loss_price': 0.0, 'stop_order_id': None
+    }
 }
 
 HEADERS = {
     'X-MBX-APIKEY': BINANCE_API_KEY,
-    'User-Agent': 'QuantBot/2.0'
+    'User-Agent': 'QuantBot/4.0'
 }
 
 # ==============================================================================
@@ -68,18 +71,20 @@ def send_whatsapp_alert(message_text):
             print(f"❌ WhatsApp Error: {e}")
 
 # ==============================================================================
-# תקשורת מול BINANCE Futures API
+# תקשורת מול BINANCE (Spot & Futures)
 # ==============================================================================
 def generate_signature(params):
     query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
     return hmac.new(BINANCE_SECRET_KEY.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
 
-def binance_futures_request(method, endpoint, params=None):
+def binance_request(method, endpoint, params=None, is_futures=True):
     if params is None:
         params = {}
     params['timestamp'] = int(time.time() * 1000)
     params['signature'] = generate_signature(params)
-    url = f"https://fapi.binance.com{endpoint}"
+    
+    base_url = "https://fapi.binance.com" if is_futures else "https://api.binance.com"
+    url = f"{base_url}{endpoint}"
     
     try:
         if method == 'GET':
@@ -94,66 +99,32 @@ def binance_futures_request(method, endpoint, params=None):
         return None
 
 def get_account_balance():
-    """שליפת יתרת USDT זמינה בחוזים עתידיים"""
-    res = binance_futures_request('GET', '/fapi/v2/balance')
-    if res and isinstance(res, list):
-        for asset in res:
+    fut_bal = 0.0
+    spot_bal = 0.0
+    
+    res_fut = binance_request('GET', '/fapi/v2/balance', is_futures=True)
+    if res_fut and isinstance(res_fut, list):
+        for asset in res_fut:
             if asset.get('asset') == 'USDT':
-                return float(asset.get('balance', 0.0))
-    return 0.0
+                fut_bal = float(asset.get('balance', 0.0))
 
-def get_symbol_precision(symbol):
-    try:
-        res = requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=5).json()
-        for s in res['symbols']:
-            if s['symbol'] == symbol:
-                return int(s['quantityPrecision']), int(s['pricePrecision'])
-    except Exception:
-        pass
-    return 3, 2
+    res_spot = binance_request('GET', '/api/v3/account', is_futures=False)
+    if res_spot and 'balances' in res_spot:
+        for asset in res_spot['balances']:
+            if asset.get('asset') == 'USDT':
+                spot_bal = float(asset.get('free', 0.0))
+
+    return fut_bal + spot_bal
 
 # ==============================================================================
-# ניתוח נזילות ומשטר שוק (Market Regime & Order Book)
+# חישוב אינדיקטורים טכניים
 # ==============================================================================
-def get_market_regime():
-    """בדיקת המגמה הכללית של הביטקוין (BTCUSDT) להגדרת כיוון השוק"""
+def calculate_indicators(symbol, is_futures=True):
+    endpoint = "/fapi/v1/klines" if is_futures else "/api/v3/klines"
+    base_url = "https://fapi.binance.com" if is_futures else "https://api.binance.com"
+    
     try:
-        res = requests.get("https://fapi.binance.com/fapi/v1/klines", 
-                           params={'symbol': 'BTCUSDT', 'interval': '1h', 'limit': 50}, timeout=5).json()
-        closes = np.array([float(k[4]) for k in res])
-        ema20 = np.mean(closes[-20:])
-        current_btc = closes[-1]
-        
-        if current_btc > ema20 * 1.002:
-            return 'BULLISH'
-        elif current_btc < ema20 * 0.998:
-            return 'BEARISH'
-        else:
-            return 'NEUTRAL'
-    except Exception:
-        return 'NEUTRAL'
-
-def check_order_book_depth(symbol, side, amount_usdt):
-    """בדיקה שספר הפקודות מספיק עמוק כדי למנוע Slippage (החלקה של המחיר)"""
-    try:
-        res = requests.get("https://fapi.binance.com/fapi/v1/depth", 
-                           params={'symbol': symbol, 'limit': 10}, timeout=5).json()
-        bids = res.get('bids', [])
-        asks = res.get('asks', [])
-        
-        target_list = asks if side == 'BUY' else bids
-        available_depth = sum([float(item[0]) * float(item[1]) for item in target_list])
-        
-        return available_depth >= (amount_usdt * 5)
-    except Exception:
-        return False
-
-# ==============================================================================
-# חישוב אינדיקטורים טכניים (EMA 200, EMA 20, RSI, ATR, Volume Spike)
-# ==============================================================================
-def calculate_indicators(symbol):
-    try:
-        res = requests.get("https://fapi.binance.com/fapi/v1/klines", 
+        res = requests.get(f"{base_url}{endpoint}", 
                            params={'symbol': symbol, 'interval': '5m', 'limit': 250}, headers=HEADERS, timeout=5)
         if res.status_code != 200:
             return None
@@ -169,15 +140,12 @@ def calculate_indicators(symbol):
     lows = np.array([float(k[3]) for k in klines])
     volumes = np.array([float(k[5]) for k in klines])
 
-    # 1. קפיצת נפח (Volume Spike)
     avg_vol = np.mean(volumes[-7:-1])
     vol_spike = (volumes[-1] / avg_vol) if avg_vol > 0 else 1.0
 
-    # 2. ממוצעים נעים (EMA 20 + EMA 200)
     ema20 = np.mean(closes[-20:])
     ema200 = np.mean(closes[-200:])
 
-    # 3. מדד עוצמה יחסית (RSI 14)
     deltas = np.diff(closes)
     seed = deltas[:14]
     up = seed[seed >= 0].sum() / 14
@@ -185,11 +153,12 @@ def calculate_indicators(symbol):
     rs = up / down if down != 0 else 0
     rsi = 100. - (100. / (1. + rs))
 
-    # 4. מדד תנודתיות (ATR 14)
     tr = np.maximum(highs[1:] - lows[1:], np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1])))
     atr = np.mean(tr[-14:])
 
     return {
+        'symbol': symbol,
+        'is_futures': is_futures,
         'price': closes[-1],
         'vol_spike': vol_spike,
         'ema20': ema20,
@@ -198,11 +167,41 @@ def calculate_indicators(symbol):
         'atr': atr
     }
 
+def analyze_single_ticker(ticker_data):
+    sym = ticker_data['symbol']
+    is_futures = ticker_data['is_futures']
+
+    if not sym.endswith('USDT') or any(x in sym for x in ['UPUSDT', 'DOWNUSDT', 'USDCUSDT', 'BUSDUSDT']):
+        return None
+
+    if float(ticker_data.get('quoteVolume', 0)) < MIN_DAILY_VOLUME:
+        return None
+
+    data = calculate_indicators(sym, is_futures=is_futures)
+    if not data:
+        return None
+
+    price = data['price']
+    spike = data['vol_spike']
+    ema20 = data['ema20']
+    ema200 = data['ema200']
+    rsi = data['rsi']
+
+    if spike >= 2.0 and price > ema200 and price > ema20 and (52 <= rsi <= 68):
+        data['signal'] = 'LONG'
+        return data
+
+    elif is_futures and spike >= 2.0 and price < ema200 and price < ema20 and (32 <= rsi <= 48):
+        data['signal'] = 'SHORT'
+        return data
+
+    return None
+
 # ==============================================================================
-# לולאת המסחר הראשית (Quantitative Autonomous Loop)
+# לולאת המסחר הראשית (איפשר עבודה במקביל ב-Futures וב-Spot + כניסה חוזרת)
 # ==============================================================================
 def auto_trading_loop():
-    global TRADING_ACTIVE, position, account_guard
+    global TRADING_ACTIVE, positions, account_guard
 
     account_guard['start_balance'] = get_account_balance()
 
@@ -210,7 +209,6 @@ def auto_trading_loop():
         try:
             now = datetime.now()
 
-            # 1. בדיקת מנגנון נעילת הפסד יומי
             if account_guard['lock_until']:
                 if now < account_guard['lock_until']:
                     time.sleep(30)
@@ -222,226 +220,191 @@ def auto_trading_loop():
 
             if TRADING_ACTIVE:
 
-                # 2. מעקב וניהול פוזיציה פתוחה בלייב
-                if position['in_trade']:
-                    sym = position['symbol']
-                    data = calculate_indicators(sym)
+                # 1. ניהול בלייב של שני השווקים במקביל
+                for m_type in ['FUTURES', 'SPOT']:
+                    pos = positions[m_type]
+                    is_fut = (m_type == 'FUTURES')
 
-                    if data:
-                        current_price = data['price']
-                        entry = position['entry_price']
-                        side = position['side']
-                        atr = data['atr']
+                    if pos['in_trade']:
+                        sym = pos['symbol']
+                        data = calculate_indicators(sym, is_futures=is_fut)
 
-                        close_trade = False
-                        reason = ""
+                        if data:
+                            current_price = data['price']
+                            entry = pos['entry_price']
+                            side = pos['side']
+                            atr = data['atr']
 
-                        if side == 'LONG':
-                            if current_price > position['highest_price']:
-                                position['highest_price'] = current_price
+                            close_trade = False
+                            reason = ""
 
-                            trailing_stop = position['highest_price'] - (atr * 1.5)
-                            hard_stop = position['stop_loss_price']
+                            if side == 'LONG':
+                                if current_price > pos['highest_price']:
+                                    pos['highest_price'] = current_price
 
-                            if current_price <= hard_stop:
-                                close_trade = True
-                                reason = "Stop Loss Hit (ATR Protected)"
-                            elif current_price <= trailing_stop and position['highest_price'] > (entry + (atr * 1.2)):
-                                close_trade = True
-                                reason = "Trailing Stop Hit (Profit Secured)"
+                                trailing_stop = pos['highest_price'] - (atr * 1.5)
+                                if current_price <= pos['stop_loss_price']:
+                                    close_trade = True
+                                    reason = "Stop Loss Hit"
+                                elif current_price <= trailing_stop and pos['highest_price'] > (entry + (atr * 1.2)):
+                                    close_trade = True
+                                    reason = "Trailing Stop Hit (Profit Secured)"
 
-                        elif side == 'SHORT':
-                            if current_price < position['lowest_price']:
-                                position['lowest_price'] = current_price
+                            elif side == 'SHORT':
+                                if current_price < pos['lowest_price']:
+                                    pos['lowest_price'] = current_price
 
-                            trailing_stop = position['lowest_price'] + (atr * 1.5)
-                            hard_stop = position['stop_loss_price']
+                                trailing_stop = pos['lowest_price'] + (atr * 1.5)
+                                if current_price >= pos['stop_loss_price']:
+                                    close_trade = True
+                                    reason = "Stop Loss Hit"
+                                elif current_price >= trailing_stop and pos['lowest_price'] < (entry - (atr * 1.2)):
+                                    close_trade = True
+                                    reason = "Trailing Stop Hit (Profit Secured)"
 
-                            if current_price >= hard_stop:
-                                close_trade = True
-                                reason = "Stop Loss Hit (ATR Protected)"
-                            elif current_price >= trailing_stop and position['lowest_price'] < (entry - (atr * 1.2)):
-                                close_trade = True
-                                reason = "Trailing Stop Hit (Profit Secured)"
+                            if close_trade:
+                                if is_fut:
+                                    if pos['stop_order_id']:
+                                        binance_request('DELETE', '/fapi/v1/order', {'symbol': sym, 'orderId': pos['stop_order_id']}, is_futures=True)
+                                    close_side = 'SELL' if side == 'LONG' else 'BUY'
+                                    binance_request('POST', '/fapi/v1/order', {
+                                        'symbol': sym, 'side': close_side, 'type': 'MARKET',
+                                        'quantity': str(pos['quantity']), 'reduceOnly': 'true'
+                                    }, is_futures=True)
+                                else:
+                                    binance_request('POST', '/api/v3/order', {
+                                        'symbol': sym, 'side': 'SELL', 'type': 'MARKET',
+                                        'quantity': str(pos['quantity'])
+                                    }, is_futures=False)
 
-                        if close_trade:
-                            if position['stop_order_id']:
-                                binance_futures_request('DELETE', '/fapi/v1/order', 
-                                                        {'symbol': sym, 'orderId': position['stop_order_id']})
+                                pnl = (current_price - entry) * pos['quantity'] if side == 'LONG' else (entry - current_price) * pos['quantity']
+                                account_guard['daily_pnl'] += pnl
 
-                            close_side = 'SELL' if side == 'LONG' else 'BUY'
-                            binance_futures_request('POST', '/fapi/v1/order', {
-                                'symbol': sym, 'side': close_side, 'type': 'MARKET',
-                                'quantity': str(position['quantity']), 'reduceOnly': 'true'
-                            })
+                                send_whatsapp_alert(f"🏁 *עסקה נסגרה ב-{m_type}!*\n\n• מטבע: {sym}\n• סוג: {side}\n• מחיר יציאה: ${current_price}\n• PnL מוערך: ${pnl:.2f}\n• סיבה: {reason}")
+                                
+                                # איפוס הפוזיציה כדי לאפשר כניסה חוזרת מיידית (Re-entry) במידה ויש איתות חדש!
+                                pos['in_trade'] = False
 
-                            pnl = (current_price - entry) * position['quantity'] if side == 'LONG' else (entry - current_price) * position['quantity']
-                            account_guard['daily_pnl'] += pnl
+                # 2. סורק הזדמנויות חדשות (במידה ואחד השווקים פנוי)
+                need_futures = not positions['FUTURES']['in_trade']
+                need_spot = not positions['SPOT']['in_trade']
 
-                            if account_guard['start_balance'] > 0:
-                                loss_ratio = abs(account_guard['daily_pnl']) / account_guard['start_balance']
-                                if account_guard['daily_pnl'] < 0 and loss_ratio >= MAX_DAILY_LOSS_PCT:
-                                    account_guard['lock_until'] = now + timedelta(hours=24)
-                                    send_whatsapp_alert(f"🛑 *נעילת הגנה הופעלה!*\n\nהגעת להפסד יומי של {loss_ratio*100:.1f}%. המסחר ננעל ל-24 שעות הקרובות להגנה על החשבון.")
-
-                            send_whatsapp_alert(f"🏁 *עסקה נסגרה ב-Binance!*\n\n• מטבע: {sym}\n• סוג: {side}\n• מחיר יציאה: ${current_price}\n• PnL מוערך: ${pnl:.2f}\n• סיבה: {reason}")
-                            position['in_trade'] = False
-
-                # 3. סריקת הזדמנויות כניסה חדשות
-                else:
-                    regime = get_market_regime()
+                if need_futures or need_spot:
+                    all_tickers = []
                     
-                    try:
-                        tickers = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", headers=HEADERS, timeout=5).json()
-                    except Exception:
-                        tickers = []
+                    if need_futures:
+                        try:
+                            fut_tickers = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", headers=HEADERS, timeout=5).json()
+                            for t in fut_tickers:
+                                t['is_futures'] = True
+                                all_tickers.append(t)
+                        except Exception:
+                            pass
 
-                    for ticker in tickers:
-                        sym = ticker['symbol']
-                        if not sym.endswith('USDT') or any(x in sym for x in ['UPUSDT', 'DOWNUSDT', 'USDCUSDT']):
-                            continue
+                    if need_spot:
+                        try:
+                            spot_tickers = requests.get("https://api.binance.com/api/v3/ticker/24hr", headers=HEADERS, timeout=5).json()
+                            fut_symbols = {t['symbol'] for t in all_tickers if t.get('is_futures')}
+                            for t in spot_tickers:
+                                if t['symbol'] not in fut_symbols:
+                                    t['is_futures'] = False
+                                    all_tickers.append(t)
+                        except Exception:
+                            pass
 
-                        if float(ticker['quoteVolume']) < MIN_DAILY_VOLUME:
-                            continue
+                    # סריקה מקבילית
+                    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_THREADS) as executor:
+                        future_to_ticker = {executor.submit(analyze_single_ticker, ticker): ticker for ticker in all_tickers}
+                        for future in as_completed(future_to_ticker):
+                            res = future.result()
+                            if res and res.get('signal'):
+                                is_fut = res['is_futures']
+                                m_key = 'FUTURES' if is_fut else 'SPOT'
 
-                        data = calculate_indicators(sym)
-                        if not data:
-                            continue
+                                if not positions[m_key]['in_trade']:
+                                    sym = res['symbol']
+                                    price = res['price']
+                                    signal = res['signal']
+                                    spike = res['vol_spike']
+                                    atr = res['atr']
 
-                        price = data['price']
-                        spike = data['vol_spike']
-                        ema20 = data['ema20']
-                        ema200 = data['ema200']
-                        rsi = data['rsi']
-                        atr = data['atr']
+                                    if is_fut:
+                                        qty = round((BASE_USDT_SIZE * LEVERAGE) / price, 3)
+                                        binance_request('POST', '/fapi/v1/leverage', {'symbol': sym, 'leverage': LEVERAGE}, is_futures=True)
+                                        order_res = binance_request('POST', '/fapi/v1/order', {
+                                            'symbol': sym, 'side': ('BUY' if signal == 'LONG' else 'SELL'), 
+                                            'type': 'MARKET', 'quantity': str(qty)
+                                        }, is_futures=True)
 
-                        # כניסה ל-LONG (מחיר מעל EMA 200 + EMA 20, RSI בריא, קפיצת נפח)
-                        if regime != 'BEARISH' and spike >= 2.0 and price > ema200 and price > ema20 and (52 <= rsi <= 68):
-                            if check_order_book_depth(sym, 'BUY', BASE_USDT_SIZE * LEVERAGE):
-                                q_prec, p_prec = get_symbol_precision(sym)
-                                qty = round((BASE_USDT_SIZE * LEVERAGE) / price, q_prec)
+                                        if order_res and 'orderId' in order_res:
+                                            sl_price = round(price - (atr * 2.0) if signal == 'LONG' else price + (atr * 2.0), 2)
+                                            sl_res = binance_request('POST', '/fapi/v1/order', {
+                                                'symbol': sym, 'side': ('SELL' if signal == 'LONG' else 'BUY'), 
+                                                'type': 'STOP_MARKET', 'stopPrice': str(sl_price), 'closePosition': 'true'
+                                            }, is_futures=True)
 
-                                if qty > 0:
-                                    binance_futures_request('POST', '/fapi/v1/leverage', {'symbol': sym, 'leverage': LEVERAGE})
-                                    res = binance_futures_request('POST', '/fapi/v1/order', {
-                                        'symbol': sym, 'side': 'BUY', 'type': 'MARKET', 'quantity': str(qty)
-                                    })
+                                            positions['FUTURES'].update({
+                                                'in_trade': True, 'symbol': sym, 'side': signal,
+                                                'entry_price': price, 'highest_price': price, 'lowest_price': price,
+                                                'quantity': qty, 'stop_loss_price': sl_price,
+                                                'stop_order_id': sl_res.get('orderId') if sl_res else None
+                                            })
+                                            send_whatsapp_alert(f"🚀 *עסקת FUTURES נפתחה!*\n\n• מטבע: *{sym}*\n• סוג: {signal}\n• מחיר כניסה: ${price}\n• קפיצת נפח: פי {spike:.1f}\n• Stop Loss: ${sl_price}")
 
-                                    if res and 'orderId' in res:
-                                        sl_price = round(price - (atr * 2.0), p_prec)
-                                        
-                                        sl_res = binance_futures_request('POST', '/fapi/v1/order', {
-                                            'symbol': sym, 'side': 'SELL', 'type': 'STOP_MARKET',
-                                            'stopPrice': str(sl_price), 'closePosition': 'true'
-                                        })
+                                    else:
+                                        qty = round(BASE_USDT_SIZE / price, 3)
+                                        order_res = binance_request('POST', '/api/v3/order', {
+                                            'symbol': sym, 'side': 'BUY', 'type': 'MARKET', 'quantity': str(qty)
+                                        }, is_futures=False)
 
-                                        position['in_trade'] = True
-                                        position['symbol'] = sym
-                                        position['side'] = 'LONG'
-                                        position['entry_price'] = price
-                                        position['highest_price'] = price
-                                        position['quantity'] = qty
-                                        position['stop_loss_price'] = sl_price
-                                        position['stop_order_id'] = sl_res.get('orderId') if sl_res else None
-
-                                        send_whatsapp_alert(f"🚀 *עסקת LONG מוסדית נפתחה!*\n\n• מטבע: *{sym}*\n• מחיר כניסה: ${price}\n• קפיצת נפח: פי {spike:.1f}\n• מעל EMA200: כן\n• Stop Loss ב-Binance: ${sl_price}")
-                                        break
-
-                        # כניסה ל-SHORT (מחיר מתחת ל-EMA 200 + EMA 20, RSI בריא, קפיצת נפח)
-                        elif regime != 'BULLISH' and spike >= 2.0 and price < ema200 and price < ema20 and (32 <= rsi <= 48):
-                            if check_order_book_depth(sym, 'SELL', BASE_USDT_SIZE * LEVERAGE):
-                                q_prec, p_prec = get_symbol_precision(sym)
-                                qty = round((BASE_USDT_SIZE * LEVERAGE) / price, q_prec)
-
-                                if qty > 0:
-                                    binance_futures_request('POST', '/fapi/v1/leverage', {'symbol': sym, 'leverage': LEVERAGE})
-                                    res = binance_futures_request('POST', '/fapi/v1/order', {
-                                        'symbol': sym, 'side': 'SELL', 'type': 'MARKET', 'quantity': str(qty)
-                                    })
-
-                                    if res and 'orderId' in res:
-                                        sl_price = round(price + (atr * 2.0), p_prec)
-                                        
-                                        sl_res = binance_futures_request('POST', '/fapi/v1/order', {
-                                            'symbol': sym, 'side': 'BUY', 'type': 'STOP_MARKET',
-                                            'stopPrice': str(sl_price), 'closePosition': 'true'
-                                        })
-
-                                        position['in_trade'] = True
-                                        position['symbol'] = sym
-                                        position['side'] = 'SHORT'
-                                        position['entry_price'] = price
-                                        position['lowest_price'] = price
-                                        position['quantity'] = qty
-                                        position['stop_loss_price'] = sl_price
-                                        position['stop_order_id'] = sl_res.get('orderId') if sl_res else None
-
-                                        send_whatsapp_alert(f"📉 *עסקת SHORT מוסדית נפתחה!*\n\n• מטבע: *{sym}*\n• מחיר כניסה: ${price}\n• קפיצת נפח: פי {spike:.1f}\n• מתחת ל-EMA200: כן\n• Stop Loss ב-Binance: ${sl_price}")
-                                        break
-
-                        time.sleep(0.05)
+                                        if order_res and 'orderId' in order_res:
+                                            sl_price = round(price - (atr * 2.0), 2)
+                                            positions['SPOT'].update({
+                                                'in_trade': True, 'symbol': sym, 'side': 'LONG',
+                                                'entry_price': price, 'highest_price': price, 'lowest_price': price,
+                                                'quantity': qty, 'stop_loss_price': sl_price, 'stop_order_id': None
+                                            })
+                                            send_whatsapp_alert(f"🚀 *עסקת SPOT נפתחה!*\n\n• מטבע: *{sym}*\n• סוג: LONG\n• מחיר כניסה: ${price}\n• קפיצת נפח: פי {spike:.1f}\n• Stop Loss: ${sl_price}")
 
         except Exception as e:
             print(f"Error in main loop: {e}")
 
-        time.sleep(10)
+        time.sleep(5)
 
 # הפעלת הלולאה ברקע
 thread = Thread(target=auto_trading_loop, daemon=True)
 thread.start()
 
 # ==============================================================================
-# ממשק WhatsApp Webhook
+# Webhook
 # ==============================================================================
 @app.route('/', methods=['GET'])
 def home():
-    return "Institutional Quantitative Bot Running!"
+    return "Multi-Market Parallel Quant Bot Running!"
 
 @app.route('/webhook', methods=['POST'])
 @app.route('/whatsapp', methods=['POST'])
 def whatsapp_reply():
-    global TRADING_ACTIVE, position, account_guard
+    global TRADING_ACTIVE, positions
     raw_msg = request.values.get('Body', '').strip().lower()
     resp = MessagingResponse()
     msg = resp.message()
 
     if raw_msg in ['סטטוס', 'status']:
-        state = "🟢 פעיל (סורק עצמאי)" if TRADING_ACTIVE else "🔴 מוקפא"
-        if account_guard['lock_until']:
-            state = f"🔒 ננעל להגנה עד {account_guard['lock_until'].strftime('%H:%M')}"
+        state = "🟢 פעיל (Spot + Futures)" if TRADING_ACTIVE else "🔴 מוקפא"
+        
+        fut_info = f"🔥 FUTURES: {positions['FUTURES']['side']} על {positions['FUTURES']['symbol']} (${positions['FUTURES']['entry_price']})" if positions['FUTURES']['in_trade'] else "🔍 FUTURES: סורק..."
+        spot_info = f"🔥 SPOT: LONG על {positions['SPOT']['symbol']} (${positions['SPOT']['entry_price']})" if positions['SPOT']['in_trade'] else "🔍 SPOT: סורק..."
 
-        pos_info = "🔍 סורק את השוק וממתין להזדמנות כניסה..."
-        if position['in_trade']:
-            pos_info = f"🔥 **פוזיציה בלייב:** {position['side']} על **{position['symbol']}**\n• מחיר כניסה: ${position['entry_price']}\n• כמות: {position['quantity']}\n• Stop Loss ב-Binance: ${position['stop_loss_price']}"
-
-        msg.body(f"📊 *סטטוס הבוט:* {state}\n• PnL יומי: ${account_guard['daily_pnl']:.2f}\n\n📌 *מצב נוכחי:*\n{pos_info}")
+        msg.body(f"📊 *סטטוס הבוט:* {state}\n• PnL יומי: ${account_guard['daily_pnl']:.2f}\n\n📌 *מצב נוכחי:*\n• {fut_info}\n• {spot_info}")
 
     elif raw_msg in ['עצור', 'stop']:
         TRADING_ACTIVE = False
-        msg.body("🛑 המסחר הוקפא! הבוט לא יפתח עסקאות חדשות.")
+        msg.body("🛑 המסחר הוקפא!")
 
     elif raw_msg in ['הפעל', 'start']:
         TRADING_ACTIVE = True
-        account_guard['lock_until'] = None
-        msg.body("🟢 הבוט הופעל מחדש וחוזר לסרוק עצמאית!")
-
-    elif raw_msg in ['סגור הכל', 'close']:
-        if position['in_trade']:
-            sym = position['symbol']
-            close_side = 'SELL' if position['side'] == 'LONG' else 'BUY'
-            binance_futures_request('POST', '/fapi/v1/order', {
-                'symbol': sym, 'side': close_side, 'type': 'MARKET',
-                'quantity': str(position['quantity']), 'reduceOnly': 'true'
-            })
-            position['in_trade'] = False
-            TRADING_ACTIVE = False
-            msg.body(f"⚠️ הפוזיציה על {sym} נסגרה בלייב והמסחר הופסק!")
-        else:
-            TRADING_ACTIVE = False
-            msg.body("אין פוזיציה פתוחה. המסחר הופסק.")
-
-    else:
-        msg.body("📌 פקודות זמינות:\n• `סטטוס`\n• `עצור`\n• `הפעל`\n• `סגור הכל`")
+        msg.body("🟢 הבוט הופעל מחדש!")
 
     return str(resp)
 
